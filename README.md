@@ -18,18 +18,37 @@ Les documents d'origine ne sont jamais modifiés.
 
 ## Installation
 
-Prérequis système :
+Deux moteurs de conversion Word sont disponibles :
 
-- [pandoc](https://pandoc.org/installing.html) — conversion des `.docx`
+- **python** (mammoth) : aucun logiciel à installer en dehors de Python, adapté aux
+  postes sur lesquels on ne peut rien installer d'autre que des paquets `pip` ;
+- **pandoc** : utilisé automatiquement s'il est installé.
+
+Les deux produisent un résultat équivalent (révisions acceptées, tableaux Markdown,
+notes de bas de page). Le moteur python retire en plus les lignes de tableau
+supprimées en mode révision, que pandoc conserve.
+
+Minimum, pour les `.docx` sans OCR :
+
+```
+pip install mammoth beautifulsoup4
+```
+
+Prérequis système optionnels :
+
+- [pandoc](https://pandoc.org/installing.html) 3.1 ou plus — autre moteur de conversion des `.docx`
 - [Tesseract](https://tesseract-ocr.github.io/tessdoc/Installation.html) avec le pack
   de langue français (`fra`) — OCR des images (sous Linux : `apt install tesseract-ocr tesseract-ocr-fra`)
 - LibreOffice (optionnel) — OCR des schémas au format `.emf` / `.wmf`
 
-Puis :
+Pour tout installer (OCR et PDF compris) :
 
 ```
 pip install -r requirements.txt
 ```
+
+Paquets par usage : `mammoth` et `beautifulsoup4` (Word sans pandoc), `pytesseract` et
+`pillow` (OCR), `pymupdf4llm` (PDF, licence AGPL-3.0).
 
 ## Utilisation
 
@@ -72,6 +91,7 @@ pip install -r requirements.txt
 | `--essai TEXTE` | teste la table sur un texte, sans traiter de fichier |
 | `--limite N` | ne traite que les N premiers fichiers |
 | `--contexte` | produit `contextes.csv` : chaque remplacement avec son extrait avant/après |
+| `--moteur auto\|pandoc\|python` | moteur de conversion Word (auto : pandoc s'il est installé, sinon python) |
 | `--sans-ocr` | ignore le texte des images |
 | `--ocr-confiance N` | confiance minimale par mot OCR (0-100, défaut 70) |
 | `--workers N` | nombre de fichiers traités en parallèle |

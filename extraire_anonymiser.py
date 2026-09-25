@@ -39,6 +39,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -180,7 +181,7 @@ def emf_vers_png(chemins, dossier):
     if not soffice or not chemins:
         return {}
     profil = Path(dossier) / "lo_profil"
-    subprocess.run([soffice, f"-env:UserInstallation=file://{profil}", "--headless",
+    subprocess.run([soffice, f"-env:UserInstallation={profil.resolve().as_uri()}", "--headless",
                     "--convert-to", "png", "--outdir", str(dossier), *map(str, chemins)],
                    capture_output=True, timeout=300)
     return {c: Path(dossier) / (Path(c).stem + ".png") for c in chemins
@@ -194,22 +195,337 @@ def bloc_ocr(texte, en_ligne):
             + "\n".join("> " + l for l in texte.splitlines()) + "\n\n")
 
 
+
+# ------------------------------------------------------- moteur Python ----
+# Conversion Word -> Markdown sans pandoc (pip install mammoth beautifulsoup4).
+# Même résultat que le moteur pandoc : révisions acceptées, table des matières
+# retirée, tableaux Markdown (une ligne par cellule), notes sous les tableaux.
+W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+EXT_IMAGES = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/bmp": "bmp",
+              "image/tiff": "tif", "image/x-emf": "emf", "image/emf": "emf",
+              "image/x-wmf": "wmf", "image/wmf": "wmf"}
+TITRES_TDM = {"table des matières", "table des matieres", "sommaire", "contents", "table of contents"}
+
+
+def _w(tag):
+    return f"{{{W_NS}}}{tag}"
+
+
+def accepter_revisions_xml(data):
+    """Accepte les modifications suivies d'une partie XML Word (texte supprimé retiré,
+    texte inséré conservé, historique de mise en forme supprimé)."""
+    import xml.etree.ElementTree as ET
+    for _, (prefixe, uri) in ET.iterparse(io.BytesIO(data), events=("start-ns",)):
+        try:
+            ET.register_namespace(prefixe, uri)
+        except ValueError:
+            pass
+    racine = ET.fromstring(data)
+    parent = {enfant: pere for pere in racine.iter() for enfant in pere}
+    marques = (_w("rPr"), _w("pPr"), _w("trPr"))
+
+    def retirer(el):
+        pere = parent.get(el)
+        if pere is not None and el in list(pere):
+            pere.remove(el)
+
+    # lignes de tableau supprimées
+    for tr in list(racine.iter(_w("tr"))):
+        trpr = tr.find(_w("trPr"))
+        if trpr is not None and trpr.find(_w("del")) is not None:
+            retirer(tr)
+    # contenu supprimé ou déplacé (origine)
+    for tag in ("del", "moveFrom"):
+        for el in list(racine.iter(_w(tag))):
+            if parent.get(el) is not None and parent[el].tag not in marques:
+                retirer(el)
+    # contenu inséré ou déplacé (destination) : on garde le contenu
+    for tag in ("ins", "moveTo"):
+        for el in list(racine.iter(_w(tag))):
+            pere = parent.get(el)
+            if pere is None or pere.tag in marques or el not in list(pere):
+                continue
+            i = list(pere).index(el)
+            pere.remove(el)
+            for k, enfant in enumerate(list(el)):
+                pere.insert(i + k, enfant)
+                parent[enfant] = pere
+    # marqueurs et historique de mise en forme
+    for tag in ("moveFromRangeStart", "moveFromRangeEnd", "moveToRangeStart", "moveToRangeEnd",
+                "rPrChange", "pPrChange", "sectPrChange", "tblPrChange", "tcPrChange",
+                "trPrChange", "tblGridChange", "numberingChange", "tblPrExChange"):
+        for el in list(racine.iter(_w(tag))):
+            retirer(el)
+    # marque de paragraphe supprimée : le paragraphe fusionne avec le suivant
+    for para in list(racine.iter(_w("p"))):
+        pere = parent.get(para)
+        while pere is not None and para in list(pere):
+            ppr = para.find(_w("pPr"))
+            rpr = ppr.find(_w("rPr")) if ppr is not None else None
+            if rpr is None or rpr.find(_w("del")) is None:
+                break
+            freres = list(pere)
+            i = freres.index(para)
+            if i + 1 >= len(freres) or freres[i + 1].tag != _w("p"):
+                rpr.remove(rpr.find(_w("del")))
+                break
+            suivant = freres[i + 1]
+            for enfant in list(suivant):
+                if enfant.tag != _w("pPr"):
+                    para.append(enfant)
+            para.remove(ppr)
+            nppr = suivant.find(_w("pPr"))
+            if nppr is not None:
+                para.insert(0, nppr)
+            pere.remove(suivant)
+    # marques restantes (insertions de paragraphes/lignes, suppressions déjà traitées)
+    for tag in ("ins", "del"):
+        for el in list(racine.iter(_w(tag))):
+            if parent.get(el) is not None and parent[el].tag in marques:
+                retirer(el)
+    return ET.tostring(racine, xml_declaration=True, encoding="UTF-8")
+
+
+def docx_sans_revisions(chemin):
+    """Copie en mémoire du .docx, révisions acceptées (l'original n'est pas modifié)."""
+    parties = re.compile(r"^word/(document|footnotes|endnotes)\.xml$")
+    sortie = io.BytesIO()
+    with zipfile.ZipFile(chemin) as zin, zipfile.ZipFile(sortie, "w", zipfile.ZIP_DEFLATED) as zout:
+        for info in zin.infolist():
+            data = zin.read(info)
+            if parties.match(info.filename):
+                data = accepter_revisions_xml(data)
+            zout.writestr(info, data)
+    sortie.seek(0)
+    return sortie
+
+
+class HtmlVersMarkdown:
+    """Convertit le HTML produit par mammoth en Markdown (GFM)."""
+
+    def __init__(self, html):
+        from bs4 import BeautifulSoup
+        self.soup = BeautifulSoup(html, "html.parser")
+        self.notes, self.notes_texte, self.notes_tableau = {}, [], None
+        self._extraire_notes()
+        self._retirer_tdm()
+
+    # -- préparation
+    def _extraire_notes(self):
+        for li in self.soup.select('li[id^="footnote-"], li[id^="endnote-"]'):
+            for retour in li.select('a[href^="#footnote-ref-"], a[href^="#endnote-ref-"]'):
+                retour.decompose()
+            self.notes[li["id"]] = " ".join(self._inline(li).split())
+        for ol in {li.parent for li in self.soup.select('li[id^="footnote-"], li[id^="endnote-"]')}:
+            ol.decompose()
+
+    def _retirer_tdm(self):
+        for p in self.soup.find_all("p"):
+            liens = p.find_all("a", href=re.compile(r"^#_Toc"))
+            if liens:
+                reste = p.get_text()
+                for a in liens:
+                    reste = reste.replace(a.get_text(), "")
+                if not re.sub(r"[\d\s.]", "", reste):
+                    p.decompose()
+        for el in self.soup.find_all(["p", "h1", "h2", "h3", "h4", "h5", "h6"]):
+            if " ".join(el.get_text().split()).lower() in TITRES_TDM:
+                el.decompose()
+
+    # -- en ligne
+    @staticmethod
+    def _echapper(texte):
+        texte = texte.replace("*", "\\*")
+        return re.sub(r"(?<![^\W_])_|_(?![^\W_])", r"\\_", texte)
+
+    @staticmethod
+    def _entourer(contenu, marque):
+        m = re.match(r"(\s*)(.*?)(\s*)$", contenu, re.S)
+        return f"{m.group(1)}{marque}{m.group(2)}{marque}{m.group(3)}" if m.group(2) else contenu
+
+    def _renvoi(self, a):
+        cible = a.get("href", "")[1:]
+        numero = re.sub(r"\D", "", a.get_text()) or "?"
+        texte = self.notes.get(cible, "")
+        if self.notes_tableau is not None:
+            self.notes_tableau.append(f"({numero}) {texte}")
+            return f"({numero})"
+        self.notes_texte.append(f"[^{numero}]: {texte}")
+        return f"[^{numero}]"
+
+    def _inline(self, noeud, cellule=False):
+        from bs4 import NavigableString
+        morceaux = []
+        for n in noeud.children:
+            if isinstance(n, NavigableString):
+                morceaux.append(self._echapper(re.sub(r"\s+", " ", str(n))))
+                continue
+            nom = n.name
+            if nom in ("strong", "b"):
+                morceaux.append(self._entourer(self._inline(n, cellule), "**"))
+            elif nom in ("em", "i"):
+                morceaux.append(self._entourer(self._inline(n, cellule), "*"))
+            elif nom == "br":
+                morceaux.append("<br>" if cellule else "\\\n")
+            elif nom == "img":
+                alt = " ".join((n.get("alt") or "").split()).replace("⟧", " ")
+                morceaux.append(f"⟦IMG⁞{n.get('src', '')}⁞{alt}⟧")
+            elif nom == "a" and re.match(r"#(footnote|endnote)-\d", n.get("href", "")):
+                morceaux.append(self._renvoi(n))
+            elif nom == "a" and n.get("href", "").startswith(("http", "mailto:")):
+                texte = self._inline(n, cellule)
+                morceaux.append(f"[{texte}]({n['href']})" if texte.strip() else "")
+            elif nom in ("ul", "ol", "table", "p", "h1", "h2", "h3", "h4", "h5", "h6"):
+                morceaux.append(" " + self._inline(n, cellule) + " ")
+            else:
+                morceaux.append(self._inline(n, cellule))
+        return "".join(morceaux)
+
+    # -- blocs
+    @staticmethod
+    def _debut_sur(texte):
+        """Empêche un paragraphe d'être lu comme titre, liste ou citation."""
+        texte = re.sub(r"^(\s*)([#>+\-])(\s)", r"\1\\\2\3", texte)
+        return re.sub(r"^(\s*\d+)([.)])(\s)", r"\1\\\2\3", texte)
+
+    def _liste(self, liste, niveau):
+        lignes, n = [], 0
+        for li in liste.find_all("li", recursive=False):
+            n += 1
+            puce = f"{n}." if liste.name == "ol" else "-"
+            texte, sous = [], []
+            for enfant in li.children:
+                if getattr(enfant, "name", None) in ("ul", "ol"):
+                    sous.append(self._liste(enfant, niveau + 1))
+                elif getattr(enfant, "name", None) == "table":
+                    sous.append(self._tableau(enfant))
+                elif getattr(enfant, "name", None):
+                    texte.append(self._inline(enfant))
+                else:
+                    texte.append(self._echapper(str(enfant)))
+            contenu = " ".join(" ".join(texte).split())
+            lignes.append("   " * niveau + f"{puce} {contenu}")
+            lignes.extend(s for s in sous if s)
+        return "\n".join(lignes)
+
+    def _cellule(self, td):
+        parties = []
+        for enfant in td.children:
+            nom = getattr(enfant, "name", None)
+            if nom in ("ul", "ol"):
+                for li in enfant.find_all("li"):
+                    parties.append("• " + " ".join(self._inline(li, True).split()))
+            elif nom:
+                parties.append(" ".join(self._inline(enfant, True).split()))
+            elif str(enfant).strip():
+                parties.append(self._echapper(" ".join(str(enfant).split())))
+        return "<br>".join(p for p in parties if p).replace("|", "\\|")
+
+    def _tableau(self, table):
+        self.notes_tableau = []
+        lignes = [tr for tr in table.find_all("tr") if tr.find_parent("table") is table]
+        grille, occupe = [], {}
+        for i, tr in enumerate(lignes):
+            ligne, j = [], 0
+            for td in tr.find_all(["td", "th"], recursive=False):
+                while (i, j) in occupe:
+                    ligne.append(occupe.pop((i, j)))
+                    j += 1
+                texte = self._cellule(td)
+                cs, rs = int(td.get("colspan", 1)), int(td.get("rowspan", 1))
+                for k in range(cs):
+                    ligne.append(texte if k == 0 else "")
+                    for r in range(1, rs):
+                        occupe[(i + r, j + k)] = ""
+                j += cs
+            while (i, j) in occupe:
+                ligne.append(occupe.pop((i, j)))
+                j += 1
+            grille.append(ligne)
+        notes, self.notes_tableau = self.notes_tableau, None
+        if not grille:
+            return ""
+        largeur = max(len(l) for l in grille)
+        grille = [l + [""] * (largeur - len(l)) for l in grille]
+        md = ["| " + " | ".join(grille[0]) + " |", "|" + "---|" * largeur]
+        md += ["| " + " | ".join(l) + " |" for l in grille[1:]]
+        return "\n".join(md) + ("\n\n" + "\n\n".join(notes) if notes else "")
+
+    def _blocs(self, noeud):
+        blocs = []
+        for n in noeud.children:
+            nom = getattr(n, "name", None)
+            if nom is None:
+                if str(n).strip():
+                    blocs.append(self._echapper(str(n).strip()))
+            elif re.fullmatch(r"h[1-6]", nom):
+                texte = " ".join(self._inline(n).split())
+                if texte:
+                    blocs.append("#" * int(nom[1]) + " " + texte)
+            elif nom == "p":
+                texte = self._inline(n).strip()
+                if texte:
+                    blocs.append(self._debut_sur(texte))
+            elif nom in ("ul", "ol"):
+                blocs.append(self._liste(n, 0))
+            elif nom == "table":
+                blocs.append(self._tableau(n))
+            elif nom == "a" and not n.get_text().strip() and not n.find("img"):
+                continue                                   # ancre vide
+            elif nom in ("div", "section", "article", "body", "blockquote"):
+                blocs.extend(b for b in self._blocs(n).split("\n\n") if b)
+            else:
+                texte = self._inline(n).strip()
+                if texte:
+                    blocs.append(texte)
+        return "\n\n".join(b for b in blocs if b.strip())
+
+    def convertir(self):
+        md = self._blocs(self.soup)
+        if self.notes_texte:
+            md += "\n\n" + "\n\n".join(dict.fromkeys(self.notes_texte))
+        return md
+
+
+def docx_vers_md_python(chemin, tmp):
+    try:
+        import mammoth
+    except ImportError:
+        raise RuntimeError("moteur python : pip install mammoth beautifulsoup4")
+    compteur = [0]
+
+    def image(img):
+        compteur[0] += 1
+        ext = EXT_IMAGES.get(img.content_type, "bin")
+        cible = Path(tmp) / f"image{compteur[0]}.{ext}"
+        with img.open() as f:
+            cible.write_bytes(f.read())
+        return {"src": cible.name, "alt": img.alt_text or ""}   # nom seul : pas de \ Windows
+
+    resultat = mammoth.convert_to_html(docx_sans_revisions(chemin),
+                                       convert_image=mammoth.images.img_element(image))
+    return HtmlVersMarkdown(resultat.value).convertir()
+
+
 # ------------------------------------------------------------------ DOCX ----
-def docx_vers_md(chemin, filtre, ocr):
+def docx_vers_md(chemin, filtre, ocr, moteur="pandoc"):
     with tempfile.TemporaryDirectory() as tmp:
-        r = subprocess.run(
-            ["pandoc", str(chemin), "-t", "gfm", "--wrap=none", "--track-changes=accept",
-             "--extract-media", tmp, "--lua-filter", filtre],
-            capture_output=True, text=True, encoding="utf-8")
-        if r.returncode:
-            raise RuntimeError(r.stderr.strip()[:300])
-        md = r.stdout
+        if moteur == "python":
+            md = docx_vers_md_python(chemin, tmp)
+        else:
+            r = subprocess.run(
+                ["pandoc", str(chemin), "-t", "gfm", "--wrap=none", "--track-changes=accept",
+                 "--extract-media", tmp, "--lua-filter", filtre],
+                capture_output=True, text=True, encoding="utf-8")
+            if r.returncode:
+                raise RuntimeError(r.stderr.strip()[:300])
+            md = r.stdout
         nb_images = 0
 
-        def fichier(src):   # selon la version de pandoc, chemin absolu ou relatif
+        def fichier(src):   # chemin relatif au dossier temporaire (ou absolu selon pandoc)
             src = re.sub(r"\\(.)", r"\1", src)   # échappements Markdown
-            p = Path(src)
-            return p if p.exists() else Path(tmp) / src
+            dans_tmp = Path(tmp) / src
+            return dans_tmp if dans_tmp.exists() else Path(src)
 
         vecteurs = [m for m in set(MARQUEUR.findall(md))
                     if m[0].lower().endswith((".emf", ".wmf")) and fichier(m[0]).exists()]
@@ -451,7 +767,7 @@ def note_pseudonymisation(forme, entrees):
 def rendu_markdown(texte):
     """Ce qu'affiche un visualiseur Markdown (via pandoc), pour les essais."""
     if not shutil.which("pandoc"):
-        return "(pandoc absent : rendu non disponible)"
+        return "(aperçu indisponible sans pandoc ; sans incidence sur le traitement)"
     r = subprocess.run(["pandoc", "-f", "gfm", "-t", "plain", "--wrap=none"],
                        input=texte, capture_output=True, text=True, encoding="utf-8")
     return r.stdout.strip()
@@ -468,7 +784,7 @@ def traiter(chemin, src, dst, a, filtre, entrees):
         pseudo = Pseudonymiseur(entrees, a.echapper, a.forme)
         ocr = None if a.sans_ocr else OCR(a.ocr_langue, a.ocr_confiance, a.ocr_taille_min)
         if chemin.suffix.lower() == ".docx":
-            md, nb_img = docx_vers_md(chemin, filtre, ocr)
+            md, nb_img = docx_vers_md(chemin, filtre, ocr, a.moteur)
         else:
             md, nb_img = pdf_vers_md(chemin, ocr)
             md = retirer_repetitions(md)
@@ -526,6 +842,9 @@ def main():
     ap.add_argument("--limite", type=int, help="ne traite que les N premiers fichiers (essais)")
     ap.add_argument("--contexte", action="store_true",
                     help="écrit contextes.csv : chaque occurrence avec son extrait, pour contrôle")
+    ap.add_argument("--moteur", choices=("auto", "pandoc", "python"), default="auto",
+                    help="conversion Word : pandoc, ou python (mammoth, sans pandoc) ; "
+                         "auto = pandoc s'il est installé, sinon python")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     ap.add_argument("--sans-ocr", action="store_true", help="ne pas lire le texte des images")
     ap.add_argument("--ocr-langue", default="fra+eng")
@@ -554,6 +873,17 @@ def main():
         return
     if not a.source or not a.sortie:
         ap.error("indiquez le dossier source et le dossier de sortie (ou --essai)")
+
+    if a.moteur == "auto":
+        a.moteur = "pandoc" if shutil.which("pandoc") else "python"
+    if a.moteur == "pandoc" and not shutil.which("pandoc"):
+        sys.exit("pandoc introuvable : installez-le ou utilisez --moteur python")
+    if a.moteur == "python":
+        try:
+            import mammoth, bs4  # noqa: F401
+        except ImportError:
+            sys.exit("Moteur python : installez les dépendances avec  pip install mammoth beautifulsoup4")
+    print(f"Conversion Word : moteur {a.moteur}")
 
     fichiers = sorted(p for p in a.source.rglob("*")
                       if p.suffix.lower() in (".docx", ".pdf") and not p.name.startswith("~$"))

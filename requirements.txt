@@ -1,3 +1,10 @@
-pymupdf4llm    # extraction des PDF
-pytesseract    # OCR des images (nécessite Tesseract installé sur le système)
+# Conversion Word sans pandoc (moteur "python")
+mammoth
+beautifulsoup4
+
+# OCR des images (nécessite aussi Tesseract installé sur le système)
+pytesseract
 pillow
+
+# Conversion des PDF (licence AGPL-3.0)
+pymupdf4llm
