@@ -1,0 +1,15 @@
+# Table de pseudonymisation - séparateur ; - encodage UTF-8
+# Copier ce fichier en pseudonymisation.csv (ignoré par git) puis le compléter.
+#
+# terme        : texte à rechercher (insensible à la casse ; plusieurs mots possibles)
+# remplacement : code à mettre à la place ; laissé vide = code attribué automatiquement
+#                (CATEGORIE-01, -02...) puis enregistré dans la table pour rester stable
+# mode         : prefixe = début de mot (ACME -> ACMEBOX, acme.example)   [par défaut]
+#                mot     = mot entier seulement (CLIENTX mais pas CLIENTXY)
+#                partout = n'importe où, même au milieu d'un mot
+#                regex   = expression régulière (le terme est une regex)
+# categorie    : sert à nommer les codes automatiques (ORG, CLIENT, EQUIPEMENT...)
+terme;remplacement;mode;categorie;commentaire
+ACME;ORG-01;prefixe;ORG;organisation principale
+Banque Exemple;;mot;CLIENT;terme de plusieurs mots
+srvapp01;;mot;SERVEUR;un serveur

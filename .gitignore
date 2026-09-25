@@ -1,0 +1,19 @@
+# --- Données : ne jamais publier ---
+# documents sources et résultats
+*.docx
+*.doc
+*.pdf
+*.md
+!README.md
+sortie/
+out/
+# table réelle de pseudonymisation (contient les vrais noms)
+pseudonymisation.csv
+*.csv
+!pseudonymisation.exemple.csv
+
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
